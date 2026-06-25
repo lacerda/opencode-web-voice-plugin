@@ -1,0 +1,48 @@
+{
+  "name": "opencode-web-voice-plugin",
+  "version": "0.1.0",
+  "description": "Voice input plugin for OpenCode Web through Lens.",
+  "keywords": [
+    "opencode",
+    "opencode-lens",
+    "opencode-web",
+    "speech-to-text",
+    "voice-input"
+  ],
+  "homepage": "https://github.com/Flickwire-Agent/opencode-web-voice-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/Flickwire-Agent/opencode-web-voice-plugin/issues"
+  },
+  "license": "MIT",
+  "author": "Flickwire-Agent",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Flickwire-Agent/opencode-web-voice-plugin.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./dist/plugin.js"
+  },
+  "scripts": {
+    "build": "pnpm run clean && tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "oxfmt": "0.55.0",
+    "oxlint": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.7.0"
+}
