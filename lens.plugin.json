@@ -1,0 +1,5 @@
+{
+  "name": "Voice Input",
+  "description": "Adds a microphone button to the OpenCode Web prompt composer and inserts speech-to-text transcripts.",
+  "script": "./dist/plugin.js"
+}

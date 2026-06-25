@@ -33,7 +33,7 @@ Start Lens with the voice plugin:
 
 ```bash
 cd ../opencode-lens
-OPENCODE_TARGET="http://127.0.0.1:5050" OPENCODE_WEB_PLUGINS="../opencode-web-voice-plugin/dist/plugin.js" pnpm proxy
+OPENCODE_TARGET="http://127.0.0.1:5050" OPENCODE_WEB_PLUGINS="../opencode-web-voice-plugin/lens.plugin.json" pnpm proxy
 ```
 
 Open `http://127.0.0.1:3000`. The `Mic` button appears in the prompt composer.

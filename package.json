@@ -21,12 +21,14 @@
   },
   "files": [
     "dist",
+    "lens.plugin.json",
     "README.md",
     "LICENSE"
   ],
   "type": "module",
   "exports": {
-    ".": "./dist/plugin.js"
+    ".": "./lens.plugin.json",
+    "./plugin": "./dist/plugin.js"
   },
   "scripts": {
     "build": "pnpm run clean && tsc -p tsconfig.json",
