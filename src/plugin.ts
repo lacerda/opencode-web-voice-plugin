@@ -34,6 +34,8 @@ const voiceWindow = window as VoiceWindow;
 
 type State = {
   active: boolean;
+  starting: boolean;
+  hadError: boolean;
   finalText: string;
   interimText: string;
   recognition?: SpeechRecognitionLike;
@@ -44,6 +46,8 @@ type State = {
 
 const state: State = {
   active: false,
+  starting: false,
+  hadError: false,
   finalText: "",
   interimText: "",
 };
@@ -93,7 +97,7 @@ function attachWhenReady() {
 }
 
 function toggleRecognition() {
-  if (state.active) {
+  if (state.active || state.starting) {
     state.recognition?.stop();
     return;
   }
@@ -109,30 +113,48 @@ function toggleRecognition() {
 
   state.finalText = "";
   state.interimText = "";
-  state.recognition = new Recognition();
-  state.recognition.continuous = true;
-  state.recognition.interimResults = true;
-  state.recognition.lang = document.documentElement.lang || navigator.language || "en-US";
-  state.recognition.onstart = () => {
+  state.hadError = false;
+  state.starting = true;
+  const recognition = new Recognition();
+  state.recognition = recognition;
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = document.documentElement.lang || navigator.language || "en-US";
+  recognition.onstart = () => {
+    if (state.recognition !== recognition) return;
+
+    state.starting = false;
     state.active = true;
     updateButton();
     showStatus("Listening. Click Mic again to stop.");
   };
-  state.recognition.onend = () => {
+  recognition.onend = () => {
+    if (state.recognition !== recognition) return;
+
+    state.starting = false;
     state.active = false;
-    commitTranscript();
+    state.recognition = undefined;
     updateButton();
-    showStatus(state.finalText.trim() ? "Voice input inserted." : "Voice input stopped.");
+    if (!state.hadError) {
+      commitTranscript();
+      showStatus(state.finalText.trim() ? "Voice input inserted." : "Voice input stopped.");
+    }
   };
-  state.recognition.onerror = (event) => {
+  recognition.onerror = (event) => {
+    if (state.recognition !== recognition) return;
+
+    state.starting = false;
     state.active = false;
+    state.hadError = true;
     updateButton();
     showStatus(
       `Voice input failed${event.error ? `: ${event.error}` : ""}${event.message ? ` (${event.message})` : ""}`,
       true,
     );
   };
-  state.recognition.onresult = (event) => {
+  recognition.onresult = (event) => {
+    if (state.recognition !== recognition) return;
+
     const results = Array.from(event.results);
     const final = results
       .filter((result) => result.isFinal)
@@ -148,7 +170,8 @@ function toggleRecognition() {
     showStatus((state.finalText + state.interimText).trim() || "Listening...");
   };
 
-  state.recognition.start();
+  updateButton();
+  recognition.start();
 }
 
 function commitTranscript() {
@@ -187,8 +210,10 @@ function placeCursorAtEnd(editor: HTMLElement) {
 function updateButton() {
   if (!state.button) return;
 
-  state.button.classList.toggle("is-listening", state.active);
-  state.button.setAttribute("aria-label", state.active ? "Stop voice input" : "Start voice input");
+  const recording = state.active || state.starting;
+  state.button.classList.toggle("is-listening", recording);
+  state.button.setAttribute("aria-label", recording ? "Stop voice input" : "Start voice input");
+  state.button.setAttribute("aria-pressed", String(recording));
 }
 
 function showStatus(message: string, error = false) {
@@ -275,11 +300,20 @@ function injectStyle() {
 }
 
 function cleanup() {
-  state.recognition?.stop();
+  if (state.recognition) {
+    state.recognition.onstart = null;
+    state.recognition.onend = null;
+    state.recognition.onerror = null;
+    state.recognition.onresult = null;
+    state.recognition.stop();
+  }
   state.button?.remove();
   state.style?.remove();
   state.observer?.disconnect();
   document.querySelector("[data-opencode-voice-status]")?.remove();
+  state.active = false;
+  state.starting = false;
+  state.recognition = undefined;
   voiceWindow[STATE_KEY] = undefined;
 }
 
