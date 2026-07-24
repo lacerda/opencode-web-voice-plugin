@@ -171,7 +171,19 @@ function toggleRecognition() {
   };
 
   updateButton();
-  recognition.start();
+  try {
+    recognition.start();
+  } catch (error) {
+    if (state.recognition !== recognition) return;
+
+    state.starting = false;
+    state.recognition = undefined;
+    updateButton();
+    showStatus(
+      `Voice input could not start: ${error instanceof Error ? error.message : "Unknown error"}`,
+      true,
+    );
+  }
 }
 
 function commitTranscript() {
