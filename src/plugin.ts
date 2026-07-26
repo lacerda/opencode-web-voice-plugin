@@ -233,10 +233,10 @@ function showStatus(message: string, error = false) {
   if (!status) {
     status = document.createElement("div");
     status.dataset.opencodeVoiceStatus = "true";
-    status.setAttribute("role", "status");
     document.body.appendChild(status);
   }
 
+  status.setAttribute("role", error ? "alert" : "status");
   status.textContent = message;
   status.className = error
     ? "opencode-web-voice-plugin-status is-error"
