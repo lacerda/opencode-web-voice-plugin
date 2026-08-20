@@ -136,8 +136,12 @@ function toggleRecognition() {
     state.recognition = undefined;
     updateButton();
     if (!state.hadError) {
-      commitTranscript();
-      showStatus(state.finalText.trim() ? "Voice input inserted." : "Voice input stopped.");
+      const committed = commitTranscript();
+      if (committed === true) {
+        showStatus("Voice input inserted.");
+      } else if (committed === undefined) {
+        showStatus("Voice input stopped.");
+      }
     }
   };
   recognition.onerror = (event) => {
@@ -186,16 +190,16 @@ function toggleRecognition() {
   }
 }
 
-function commitTranscript() {
+function commitTranscript(): boolean | undefined {
   const transcript = state.finalText.trim();
-  if (!transcript) return;
+  if (!transcript) return undefined;
 
   const editor = document.querySelector<HTMLElement>(
     '[data-component="prompt-input"][contenteditable="true"]',
   );
   if (!editor) {
     showStatus("Could not find the OpenCode prompt editor.", true);
-    return;
+    return false;
   }
 
   editor.focus();
@@ -207,6 +211,7 @@ function commitTranscript() {
     new InputEvent("input", { bubbles: true, inputType: "insertText", data: transcript }),
   );
   placeCursorAtEnd(editor);
+  return true;
 }
 
 function placeCursorAtEnd(editor: HTMLElement) {
