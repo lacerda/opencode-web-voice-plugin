@@ -230,6 +230,7 @@ function updateButton() {
   const recording = state.active || state.starting;
   state.button.classList.toggle("is-listening", recording);
   state.button.setAttribute("aria-label", recording ? "Stop voice input" : "Start voice input");
+  state.button.title = recording ? "Stop voice input" : "Start voice input";
   state.button.setAttribute("aria-pressed", String(recording));
 }
 
