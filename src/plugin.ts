@@ -150,6 +150,7 @@ function toggleRecognition() {
     state.starting = false;
     state.active = false;
     state.hadError = true;
+    state.recognition = undefined;
     updateButton();
     showStatus(
       `Voice input failed${event.error ? `: ${event.error}` : ""}${event.message ? ` (${event.message})` : ""}`,
