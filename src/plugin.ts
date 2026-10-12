@@ -1,55 +1,38 @@
-type SpeechRecognitionEventLike = Event & {
-  results: SpeechRecognitionResultList;
-  resultIndex: number;
-};
-
-type SpeechRecognitionErrorEventLike = Event & {
-  error?: string;
-  message?: string;
-};
-
-type SpeechRecognitionLike = EventTarget & {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onstart: (() => void) | null;
-  onend: (() => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  start: () => void;
-  stop: () => void;
-};
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+// Voice input for OpenCode Web through Lens.
+// Records audio in the browser and sends it to an OpenAI-compatible
+// transcription endpoint through Lens (POST /__lens/stt), instead of the
+// browser's Web Speech API. Audio never leaves your own machines.
 
 const STATE_KEY = "__opencodeWebVoicePlugin";
+const TRANSCRIBE_URL = "/__lens/stt";
+const DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo";
+// Override the model per browser with:
+// localStorage.setItem("opencode-voice-stt-model", "<model name>")
+const MODEL_STORAGE_KEY = "opencode-voice-stt-model";
+const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus"];
 
 type VoiceWindow = Window & {
-  SpeechRecognition?: SpeechRecognitionConstructor;
-  webkitSpeechRecognition?: SpeechRecognitionConstructor;
   [STATE_KEY]?: { cleanup: () => void };
 };
 
 const voiceWindow = window as VoiceWindow;
 
+type Phase = "idle" | "starting" | "recording" | "transcribing";
+
 type State = {
-  active: boolean;
-  starting: boolean;
-  hadError: boolean;
-  finalText: string;
-  interimText: string;
-  recognition?: SpeechRecognitionLike;
+  phase: Phase;
+  chunks: Blob[];
+  recorder?: MediaRecorder;
+  stream?: MediaStream;
+  abort?: AbortController;
   button?: HTMLButtonElement;
   style?: HTMLStyleElement;
   observer?: MutationObserver;
 };
 
 const state: State = {
-  active: false,
-  starting: false,
-  hadError: false,
-  finalText: "",
-  interimText: "",
+  phase: "idle",
+  chunks: [],
 };
 
 function main() {
@@ -84,7 +67,7 @@ function attachWhenReady() {
       <path d="M5 8.5a5 5 0 0 0 10 0M10 13.5v4M7.5 17.5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
     </svg>
   `;
-  button.addEventListener("click", toggleRecognition);
+  button.addEventListener("click", toggleRecording);
 
   if (actions) {
     actions.insertBefore(button, actions.firstChild);
@@ -96,103 +79,142 @@ function attachWhenReady() {
   updateButton();
 }
 
-function toggleRecognition() {
-  if (state.active || state.starting) {
-    state.recognition?.stop();
+async function toggleRecording() {
+  if (state.phase === "recording") {
+    state.recorder?.stop();
     return;
   }
+  if (state.phase !== "idle") return;
 
-  const Recognition = voiceWindow.SpeechRecognition ?? voiceWindow.webkitSpeechRecognition;
-  if (!Recognition) {
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
     showStatus(
-      "Speech recognition is not available in this browser. Try Chrome or Edge over localhost/HTTPS.",
+      "Microphone recording is not available here. Open OpenCode Web over HTTPS or localhost.",
       true,
     );
     return;
   }
 
-  state.finalText = "";
-  state.interimText = "";
-  state.hadError = false;
-  state.starting = true;
-  const recognition = new Recognition();
-  state.recognition = recognition;
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = document.documentElement.lang || navigator.language || "en-US";
-  recognition.onstart = () => {
-    if (state.recognition !== recognition) return;
-
-    state.starting = false;
-    state.active = true;
-    updateButton();
-    showStatus("Listening. Click Mic again to stop.");
-  };
-  recognition.onend = () => {
-    if (state.recognition !== recognition) return;
-
-    state.starting = false;
-    state.active = false;
-    state.recognition = undefined;
-    updateButton();
-    if (!state.hadError) {
-      const committed = commitTranscript();
-      if (committed === true) {
-        showStatus("Voice input inserted.");
-      } else if (committed === undefined) {
-        showStatus("Voice input stopped.");
-      }
-    }
-  };
-  recognition.onerror = (event) => {
-    if (state.recognition !== recognition) return;
-
-    state.starting = false;
-    state.active = false;
-    state.hadError = true;
-    state.recognition = undefined;
-    updateButton();
-    showStatus(
-      `Voice input failed${event.error ? `: ${event.error}` : ""}${event.message ? ` (${event.message})` : ""}`,
-      true,
-    );
-  };
-  recognition.onresult = (event) => {
-    if (state.recognition !== recognition) return;
-
-    const results = Array.from(event.results);
-    const final = results
-      .filter((result) => result.isFinal)
-      .map((result) => result[0]?.transcript ?? "")
-      .join("");
-    const interim = results
-      .filter((result) => !result.isFinal)
-      .map((result) => result[0]?.transcript ?? "")
-      .join("");
-
-    state.finalText = final;
-    state.interimText = interim;
-    showStatus((state.finalText + state.interimText).trim() || "Listening...");
-  };
-
+  state.phase = "starting";
   updateButton();
-  try {
-    recognition.start();
-  } catch (error) {
-    if (state.recognition !== recognition) return;
 
-    state.starting = false;
-    state.recognition = undefined;
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (error) {
+    state.phase = "idle";
     updateButton();
-    showStatus(
-      `Voice input could not start: ${error instanceof Error ? error.message : "Unknown error"}`,
-      true,
-    );
+    showStatus(`Microphone access failed: ${errorMessage(error)}`, true);
+    return;
+  }
+
+  let recorder: MediaRecorder;
+  try {
+    const mimeType = MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type));
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    state.phase = "idle";
+    updateButton();
+    showStatus(`Recording could not start: ${errorMessage(error)}`, true);
+    return;
+  }
+
+  state.stream = stream;
+  state.recorder = recorder;
+  state.chunks = [];
+  recorder.ondataavailable = (event) => {
+    if (event.data.size > 0) state.chunks.push(event.data);
+  };
+  recorder.onstop = () => {
+    void finishRecording(recorder);
+  };
+  recorder.start();
+
+  state.phase = "recording";
+  updateButton();
+  showStatus("Recording. Click the mic again to stop.");
+}
+
+async function finishRecording(recorder: MediaRecorder) {
+  if (state.recorder !== recorder) return;
+
+  stopStream();
+  const type = recorder.mimeType || state.chunks[0]?.type || "audio/webm";
+  const blob = new Blob(state.chunks, { type });
+  state.chunks = [];
+  state.recorder = undefined;
+
+  if (blob.size === 0) {
+    state.phase = "idle";
+    updateButton();
+    showStatus("No audio was recorded.", true);
+    return;
+  }
+
+  state.phase = "transcribing";
+  updateButton();
+  showStatus("Transcribing...");
+
+  const form = new FormData();
+  form.append("file", blob, `voice.${extensionFor(type)}`);
+  form.append("model", sttModel());
+  form.append("response_format", "json");
+
+  const abort = new AbortController();
+  state.abort = abort;
+  try {
+    const response = await fetch(TRANSCRIBE_URL, {
+      method: "POST",
+      body: form,
+      signal: abort.signal,
+    });
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 200);
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    const data = (await response.json()) as { text?: string };
+    const committed = commitTranscript((data.text ?? "").trim());
+    if (committed === true) {
+      showStatus("Voice input inserted. Review it, then send.");
+    } else if (committed === undefined) {
+      showStatus("No speech was recognized.");
+    }
+  } catch (error) {
+    if (abort.signal.aborted) return;
+    showStatus(`Transcription failed: ${errorMessage(error)}`, true);
+  } finally {
+    if (state.abort === abort) {
+      state.abort = undefined;
+      state.phase = "idle";
+      updateButton();
+    }
   }
 }
 
-function commitTranscript(): boolean | undefined {
-  const transcript = state.finalText.trim();
+function sttModel(): string {
+  try {
+    return localStorage.getItem(MODEL_STORAGE_KEY) || DEFAULT_MODEL;
+  } catch {
+    return DEFAULT_MODEL;
+  }
+}
+
+function extensionFor(type: string): string {
+  if (type.includes("mp4")) return "m4a";
+  if (type.includes("ogg")) return "ogg";
+  return "webm";
+}
+
+function stopStream() {
+  state.stream?.getTracks().forEach((track) => track.stop());
+  state.stream = undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+function commitTranscript(transcript: string): boolean | undefined {
   if (!transcript) return undefined;
 
   const editor = document.querySelector<HTMLElement>(
@@ -228,10 +250,14 @@ function placeCursorAtEnd(editor: HTMLElement) {
 function updateButton() {
   if (!state.button) return;
 
-  const recording = state.active || state.starting;
+  const recording = state.phase === "recording" || state.phase === "starting";
+  const busy = state.phase === "transcribing";
   state.button.classList.toggle("is-listening", recording);
-  state.button.setAttribute("aria-label", recording ? "Stop voice input" : "Start voice input");
-  state.button.title = recording ? "Stop voice input" : "Start voice input";
+  state.button.classList.toggle("is-busy", busy);
+  state.button.disabled = busy;
+  const label = busy ? "Transcribing" : recording ? "Stop voice input" : "Start voice input";
+  state.button.setAttribute("aria-label", label);
+  state.button.title = label;
   state.button.setAttribute("aria-pressed", String(recording));
 }
 
@@ -249,7 +275,7 @@ function showStatus(message: string, error = false) {
     ? "opencode-web-voice-plugin-status is-error"
     : "opencode-web-voice-plugin-status";
   window.setTimeout(() => {
-    if (status?.textContent === message && !state.active) status.remove();
+    if (status?.textContent === message && state.phase === "idle") status.remove();
   }, 4000);
 }
 
@@ -280,6 +306,10 @@ function injectStyle() {
     .opencode-web-voice-plugin-button.is-listening {
       color: #ef4444;
       opacity: 1;
+    }
+    .opencode-web-voice-plugin-button.is-busy {
+      opacity: 0.5;
+      cursor: progress;
     }
     .opencode-web-voice-plugin-icon {
       width: 20px;
@@ -319,20 +349,21 @@ function injectStyle() {
 }
 
 function cleanup() {
-  if (state.recognition) {
-    state.recognition.onstart = null;
-    state.recognition.onend = null;
-    state.recognition.onerror = null;
-    state.recognition.onresult = null;
-    state.recognition.stop();
+  if (state.recorder) {
+    state.recorder.ondataavailable = null;
+    state.recorder.onstop = null;
+    if (state.recorder.state !== "inactive") state.recorder.stop();
   }
+  stopStream();
+  state.abort?.abort();
   state.button?.remove();
   state.style?.remove();
   state.observer?.disconnect();
   document.querySelector("[data-opencode-voice-status]")?.remove();
-  state.active = false;
-  state.starting = false;
-  state.recognition = undefined;
+  state.phase = "idle";
+  state.chunks = [];
+  state.recorder = undefined;
+  state.abort = undefined;
   voiceWindow[STATE_KEY] = undefined;
 }
 
