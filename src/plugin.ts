@@ -1,25 +1,15 @@
 // Voice input for OpenCode Web through Lens.
-// Captures microphone audio in the browser, splits it into phrases at short
-// pauses, and sends each phrase as WAV to an OpenAI-compatible transcription
-// endpoint through Lens (POST /__lens/stt). Text appears phrase by phrase while
-// you keep talking. Audio never leaves your own machines.
+// Streams microphone audio over a WebSocket to a WhisperLiveKit server through
+// Lens (/__lens/asr) and writes the transcript into the prompt while you talk.
+// Audio never leaves your own machines.
 
 const STATE_KEY = "__opencodeWebVoicePlugin";
-const TRANSCRIBE_URL = "/__lens/stt";
-const DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo";
-// Override the model per browser with:
-// localStorage.setItem("opencode-voice-stt-model", "<model name>")
-const MODEL_STORAGE_KEY = "opencode-voice-stt-model";
-
-// Phrase detection. Times in milliseconds, levels as RMS of samples in [-1, 1].
-const WINDOW_MS = 20; // loudness is measured over windows of this length
-const SILENCE_MS = 700; // a pause this long ends a phrase
-const MIN_SPEECH_MS = 250; // shorter bursts (clicks, coughs) are dropped
-const MAX_PHRASE_MS = 25_000; // long monologues are cut at this length
-const PREROLL_MS = 300; // audio kept from just before speech starts
-const MIN_LEVEL = 0.015; // never treat anything quieter than this as speech
-const NOISE_RATIO = 3; // speech must be this many times louder than background
-const TARGET_RATE = 16_000; // sample rate sent to the transcription server
+const ASR_PATH = "/__lens/asr";
+const TARGET_RATE = 16_000; // raw audio is sent as 16 kHz, 16-bit, mono
+const SEND_INTERVAL_MS = 100; // raw audio is sent in chunks of this length
+const RECORDER_TIMESLICE_MS = 250; // WebM chunk length if the server asks for WebM
+const CONFIG_TIMEOUT_MS = 15_000; // first connection may wait for the model to load
+const STOP_TIMEOUT_MS = 30_000;
 
 const TAP_PROCESSOR = `
 class OpencodeVoiceTap extends AudioWorkletProcessor {
@@ -39,6 +29,7 @@ type VoiceWindow = Window & {
 const voiceWindow = window as VoiceWindow;
 
 type Phase = "idle" | "starting" | "listening" | "finishing";
+type AudioMode = "pending" | "pcm" | "webm";
 
 type Capture = {
   context: AudioContext;
@@ -49,55 +40,42 @@ type Capture = {
   rate: number;
 };
 
-type Detector = {
-  preroll: Float32Array[];
-  prerollSamples: number;
-  phrase: Float32Array[];
-  phraseSamples: number;
-  inPhrase: boolean;
-  speechMs: number;
-  silenceMs: number;
-  noise: number;
-  windowSum: number;
-  windowCount: number;
+type TranscriptLine = { speaker?: number; text?: string };
+type ServerMessage = {
+  type?: string;
+  useAudioWorklet?: boolean;
+  lines?: TranscriptLine[];
+  buffer_transcription?: string;
+  error?: string;
 };
 
 type State = {
   phase: Phase;
   session: number;
+  mode: AudioMode;
+  socket?: WebSocket;
   capture?: Capture;
-  detector: Detector;
-  queue: Promise<void>;
-  pending: number;
-  inserted: number;
-  abort?: AbortController;
+  recorder?: MediaRecorder;
+  pending: Float32Array[];
+  pendingSamples: number;
+  baseText: string;
+  transcript: string;
+  stopTimer?: number;
+  configTimer?: number;
+  finishStop?: () => void;
   button?: HTMLButtonElement;
   style?: HTMLStyleElement;
   observer?: MutationObserver;
 };
 
-function freshDetector(): Detector {
-  return {
-    preroll: [],
-    prerollSamples: 0,
-    phrase: [],
-    phraseSamples: 0,
-    inPhrase: false,
-    speechMs: 0,
-    silenceMs: 0,
-    noise: 0.005,
-    windowSum: 0,
-    windowCount: 0,
-  };
-}
-
 const state: State = {
   phase: "idle",
   session: 0,
-  detector: freshDetector(),
-  queue: Promise.resolve(),
-  pending: 0,
-  inserted: 0,
+  mode: "pending",
+  pending: [],
+  pendingSamples: 0,
+  baseText: "",
+  transcript: "",
 };
 
 function main() {
@@ -154,7 +132,8 @@ async function toggleRecording() {
   if (
     !navigator.mediaDevices?.getUserMedia ||
     typeof AudioContext === "undefined" ||
-    typeof AudioWorkletNode === "undefined"
+    typeof AudioWorkletNode === "undefined" ||
+    typeof WebSocket === "undefined"
   ) {
     showStatus(
       "Microphone capture is not available here. Open OpenCode Web over HTTPS or localhost.",
@@ -163,26 +142,110 @@ async function toggleRecording() {
     return;
   }
 
-  state.phase = "starting";
-  state.session += 1;
-  state.detector = freshDetector();
-  state.inserted = 0;
-  state.abort = new AbortController();
-  updateButton();
-
-  try {
-    state.capture = await startCapture(state.session);
-  } catch (error) {
-    teardownCapture();
-    state.phase = "idle";
-    updateButton();
-    showStatus(`Microphone access failed: ${errorMessage(error)}`, true);
+  const editor = findEditor();
+  if (!editor) {
+    showStatus("Could not find the OpenCode prompt editor.", true);
     return;
   }
 
-  state.phase = "listening";
+  state.phase = "starting";
+  state.session += 1;
+  const session = state.session;
+  state.mode = "pending";
+  state.pending = [];
+  state.pendingSamples = 0;
+  state.transcript = "";
+  state.baseText = editor.textContent?.replace(/\u200B/g, "") ?? "";
   updateButton();
-  showListening();
+  showStatus("Connecting...");
+
+  // Start the microphone first: Safari only allows it during the click itself.
+  try {
+    state.capture = await startCapture(session);
+  } catch (error) {
+    resetSession();
+    showStatus(`Microphone access failed: ${errorMessage(error)}`, true);
+    return;
+  }
+  if (state.session !== session) return;
+
+  openSocket(session);
+}
+
+function openSocket(session: number) {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${location.host}${ASR_PATH}`);
+  socket.binaryType = "arraybuffer";
+  state.socket = socket;
+
+  state.configTimer = window.setTimeout(() => {
+    if (state.session !== session || state.mode !== "pending") return;
+    resetSession();
+    showStatus("The transcription server did not answer in time.", true);
+  }, CONFIG_TIMEOUT_MS);
+
+  socket.onmessage = (event) => {
+    if (state.session !== session || typeof event.data !== "string") return;
+    let data: ServerMessage;
+    try {
+      data = JSON.parse(event.data) as ServerMessage;
+    } catch {
+      return;
+    }
+    onServerMessage(data, session);
+  };
+
+  socket.onclose = () => {
+    if (state.session !== session) return;
+    if (state.phase === "finishing") {
+      state.finishStop?.();
+      return;
+    }
+    if (state.phase !== "idle") {
+      resetSession();
+      showStatus("The transcription connection closed unexpectedly.", true);
+    }
+  };
+
+  socket.onerror = () => {
+    // onclose follows and reports the problem.
+  };
+}
+
+function onServerMessage(data: ServerMessage, session: number) {
+  if (data.type === "config") {
+    window.clearTimeout(state.configTimer);
+    state.mode = data.useAudioWorklet ? "pcm" : "webm";
+    if (state.mode === "webm") startRecorder(session);
+    else flushPcm(true);
+    state.phase = "listening";
+    updateButton();
+    showStatus("Listening. Click the mic to stop.");
+    return;
+  }
+
+  if (data.type === "ready_to_stop") {
+    state.finishStop?.();
+    return;
+  }
+
+  if (data.error) {
+    showStatus(`Transcription error: ${data.error}`, true);
+    return;
+  }
+
+  if (Array.isArray(data.lines) || typeof data.buffer_transcription === "string") {
+    const finished = (data.lines ?? [])
+      .filter((line) => line.speaker !== -2)
+      .map((line) => (line.text ?? "").trim())
+      .filter(Boolean);
+    const partial = (data.buffer_transcription ?? "").trim();
+    const transcript = [...finished, partial].filter(Boolean).join(" ");
+    if (transcript !== state.transcript) {
+      state.transcript = transcript;
+      writeTranscript();
+    }
+  }
 }
 
 async function startCapture(session: number): Promise<Capture> {
@@ -205,7 +268,7 @@ async function startCapture(session: number): Promise<Capture> {
     const sink = context.createGain();
     sink.gain.value = 0; // keeps the graph running without playing anything
     tap.port.onmessage = (event: MessageEvent<Float32Array>) => {
-      if (state.session === session && state.phase === "listening") onSamples(event.data);
+      if (state.session === session) onSamples(event.data);
     };
     source.connect(tap);
     tap.connect(sink);
@@ -219,143 +282,100 @@ async function startCapture(session: number): Promise<Capture> {
 }
 
 function onSamples(samples: Float32Array) {
-  const capture = state.capture;
-  if (!capture) return;
-  const detector = state.detector;
-
-  if (detector.inPhrase) {
-    detector.phrase.push(samples);
-    detector.phraseSamples += samples.length;
-  } else {
-    detector.preroll.push(samples);
-    detector.prerollSamples += samples.length;
-    const keep = (PREROLL_MS / 1000) * capture.rate;
-    while (detector.prerollSamples - (detector.preroll[0]?.length ?? 0) > keep) {
-      detector.prerollSamples -= detector.preroll.shift()!.length;
-    }
-  }
-
-  for (let i = 0; i < samples.length; i++) detector.windowSum += samples[i] * samples[i];
-  detector.windowCount += samples.length;
-  if (detector.windowCount >= (WINDOW_MS / 1000) * capture.rate) {
-    const level = Math.sqrt(detector.windowSum / detector.windowCount);
-    detector.windowSum = 0;
-    detector.windowCount = 0;
-    onWindow(level, capture.rate);
-  }
+  if (state.mode === "webm") return;
+  state.pending.push(samples);
+  state.pendingSamples += samples.length;
+  if (state.mode === "pcm") flushPcm(false);
 }
 
-function onWindow(level: number, rate: number) {
-  const detector = state.detector;
-  const loud = level > Math.max(MIN_LEVEL, detector.noise * NOISE_RATIO);
-
-  if (!detector.inPhrase) {
-    if (loud) {
-      detector.inPhrase = true;
-      detector.phrase = detector.preroll;
-      detector.phraseSamples = detector.prerollSamples;
-      detector.preroll = [];
-      detector.prerollSamples = 0;
-      detector.speechMs = WINDOW_MS;
-      detector.silenceMs = 0;
-    } else {
-      // Slowly follow the background level while nobody is speaking.
-      detector.noise = detector.noise * 0.95 + level * 0.05;
-    }
-    return;
-  }
-
-  if (loud) {
-    detector.speechMs += WINDOW_MS;
-    detector.silenceMs = 0;
-  } else {
-    detector.silenceMs += WINDOW_MS;
-  }
-
-  const phraseMs = (detector.phraseSamples / rate) * 1000;
-  if (detector.silenceMs >= SILENCE_MS || phraseMs >= MAX_PHRASE_MS) endPhrase();
-}
-
-function endPhrase() {
+function flushPcm(force: boolean) {
   const capture = state.capture;
-  const detector = state.detector;
-  if (!capture || !detector.inPhrase) return;
+  const socket = state.socket;
+  if (!capture || !socket || socket.readyState !== WebSocket.OPEN) return;
+  if (!force && state.pendingSamples < (SEND_INTERVAL_MS / 1000) * capture.rate) return;
+  if (state.pendingSamples === 0) return;
 
-  const chunks = detector.phrase;
-  const total = detector.phraseSamples;
-  const speechMs = detector.speechMs;
-  detector.inPhrase = false;
-  detector.phrase = [];
-  detector.phraseSamples = 0;
-  detector.speechMs = 0;
-  detector.silenceMs = 0;
-
-  if (speechMs < MIN_SPEECH_MS) return;
-
-  const samples = new Float32Array(total);
+  const input = new Float32Array(state.pendingSamples);
   let offset = 0;
-  for (const chunk of chunks) {
-    samples.set(chunk, offset);
+  for (const chunk of state.pending) {
+    input.set(chunk, offset);
     offset += chunk.length;
   }
-  enqueue(encodeWav(samples, capture.rate));
-}
 
-function enqueue(wav: Blob) {
-  const session = state.session;
-  const signal = state.abort?.signal;
-  state.pending += 1;
-  showListening();
-  state.queue = state.queue
-    .then(() => transcribe(wav, session, signal))
-    .finally(() => {
-      state.pending -= 1;
-      if (state.session === session && state.phase === "listening") showListening();
-    });
-}
-
-async function transcribe(wav: Blob, session: number, signal?: AbortSignal) {
-  if (signal?.aborted) return;
-  const form = new FormData();
-  form.append("file", wav, "phrase.wav");
-  form.append("model", sttModel());
-  form.append("response_format", "json");
-
-  try {
-    const response = await fetch(TRANSCRIBE_URL, { method: "POST", body: form, signal });
-    if (!response.ok) {
-      const detail = (await response.text()).slice(0, 200);
-      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
-    }
-    const data = (await response.json()) as { text?: string };
-    if (state.session !== session) return;
-    if (commitTranscript((data.text ?? "").trim()) === true) state.inserted += 1;
-  } catch (error) {
-    if (signal?.aborted || state.session !== session) return;
-    showStatus(`Transcription failed: ${errorMessage(error)}`, true);
+  const ratio = capture.rate > TARGET_RATE ? capture.rate / TARGET_RATE : 1;
+  const outLength = Math.floor(input.length / ratio);
+  const used = Math.floor(outLength * ratio);
+  const output = new DataView(new ArrayBuffer(outLength * 2));
+  for (let i = 0; i < outLength; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.max(start + 1, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += input[j];
+    const value = Math.max(-1, Math.min(1, sum / (end - start)));
+    output.setInt16(i * 2, value < 0 ? value * 0x8000 : value * 0x7fff, true);
   }
+
+  // Keep the samples that did not fill a whole output sample for next time.
+  const rest = input.subarray(used);
+  state.pending = rest.length > 0 ? [rest.slice()] : [];
+  state.pendingSamples = rest.length;
+  if (outLength > 0) socket.send(output.buffer);
+}
+
+function startRecorder(session: number) {
+  const capture = state.capture;
+  if (!capture) return;
+  state.pending = [];
+  state.pendingSamples = 0;
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : undefined;
+  const recorder = new MediaRecorder(capture.stream, mimeType ? { mimeType } : undefined);
+  recorder.ondataavailable = (event) => {
+    const socket = state.socket;
+    if (state.session !== session || event.data.size === 0) return;
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(event.data);
+  };
+  recorder.start(RECORDER_TIMESLICE_MS);
+  state.recorder = recorder;
 }
 
 async function stopListening() {
   const session = state.session;
   state.phase = "finishing";
   updateButton();
-  endPhrase();
-  teardownCapture();
-  if (state.pending > 0) showStatus("Transcribing the last phrase...");
+  showStatus("Finishing the last words...");
 
-  await state.queue;
+  // Send what is still buffered, then the empty message that means "done".
+  if (state.mode === "pcm") flushPcm(true);
+  await stopRecorder();
+  stopCapture();
+
+  const socket = state.socket;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    await new Promise<void>((resolve) => {
+      state.finishStop = resolve;
+      state.stopTimer = window.setTimeout(resolve, STOP_TIMEOUT_MS);
+      socket.send(new ArrayBuffer(0));
+    });
+  }
   if (state.session !== session) return;
 
-  state.phase = "idle";
-  state.abort = undefined;
-  updateButton();
+  resetSession();
   showStatus(
-    state.inserted > 0 ? "Voice input inserted. Review it, then send." : "No speech was recognized.",
+    state.transcript ? "Voice input inserted. Review it, then send." : "No speech was recognized.",
   );
 }
 
-function teardownCapture() {
+function stopRecorder(): Promise<void> {
+  const recorder = state.recorder;
+  state.recorder = undefined;
+  if (!recorder || recorder.state === "inactive") return Promise.resolve();
+  return new Promise((resolve) => {
+    recorder.addEventListener("stop", () => resolve(), { once: true });
+    recorder.stop();
+  });
+}
+
+function stopCapture() {
   const capture = state.capture;
   state.capture = undefined;
   if (!capture) return;
@@ -367,80 +387,54 @@ function teardownCapture() {
   void capture.context.close();
 }
 
-function showListening() {
-  const waiting = state.pending > 0 ? ` Transcribing ${state.pending}...` : "";
-  showStatus(`Listening. Pause to send a phrase, click the mic to stop.${waiting}`);
+function resetSession() {
+  window.clearTimeout(state.configTimer);
+  window.clearTimeout(state.stopTimer);
+  state.finishStop = undefined;
+  if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
+  state.recorder = undefined;
+  stopCapture();
+  const socket = state.socket;
+  state.socket = undefined;
+  if (socket) {
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+    }
+  }
+  state.pending = [];
+  state.pendingSamples = 0;
+  state.mode = "pending";
+  state.phase = "idle";
+  updateButton();
 }
 
-function encodeWav(samples: Float32Array, rate: number): Blob {
-  // Downsample to TARGET_RATE by averaging, then write 16-bit mono PCM.
-  const outRate = rate > TARGET_RATE ? TARGET_RATE : rate;
-  const ratio = rate / outRate;
-  const length = Math.floor(samples.length / ratio);
-  const buffer = new ArrayBuffer(44 + length * 2);
-  const view = new DataView(buffer);
-
-  const writeText = (offset: number, text: string) => {
-    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
-  };
-  writeText(0, "RIFF");
-  view.setUint32(4, 36 + length * 2, true);
-  writeText(8, "WAVE");
-  writeText(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, outRate, true);
-  view.setUint32(28, outRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeText(36, "data");
-  view.setUint32(40, length * 2, true);
-
-  for (let i = 0; i < length; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.max(start + 1, Math.min(samples.length, Math.floor((i + 1) * ratio)));
-    let sum = 0;
-    for (let j = start; j < end; j++) sum += samples[j];
-    const value = Math.max(-1, Math.min(1, sum / (end - start)));
-    view.setInt16(44 + i * 2, value < 0 ? value * 0x8000 : value * 0x7fff, true);
-  }
-  return new Blob([buffer], { type: "audio/wav" });
+function findEditor(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    '[data-component="prompt-input"][contenteditable="true"]',
+  );
 }
 
-function sttModel(): string {
-  try {
-    return localStorage.getItem(MODEL_STORAGE_KEY) || DEFAULT_MODEL;
-  } catch {
-    return DEFAULT_MODEL;
-  }
+function writeTranscript() {
+  const editor = findEditor();
+  if (!editor) return;
+  const base = state.baseText;
+  const separator =
+    base.trim().length > 0 && !base.endsWith(" ") && !base.endsWith("\n") && state.transcript
+      ? " "
+      : "";
+  const text = `${base}${separator}${state.transcript}`;
+  editor.textContent = text;
+  editor.dispatchEvent(
+    new InputEvent("input", { bubbles: true, inputType: "insertText", data: state.transcript }),
+  );
+  placeCursorAtEnd(editor);
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
-}
-
-function commitTranscript(transcript: string): boolean | undefined {
-  if (!transcript) return undefined;
-
-  const editor = document.querySelector<HTMLElement>(
-    '[data-component="prompt-input"][contenteditable="true"]',
-  );
-  if (!editor) {
-    showStatus("Could not find the OpenCode prompt editor.", true);
-    return false;
-  }
-
-  editor.focus();
-  const existing = editor.textContent?.replace(/\u200B/g, "") ?? "";
-  const separator =
-    existing.trim().length > 0 && !existing.endsWith(" ") && !existing.endsWith("\n") ? " " : "";
-  editor.textContent = `${existing}${separator}${transcript}`;
-  editor.dispatchEvent(
-    new InputEvent("input", { bubbles: true, inputType: "insertText", data: transcript }),
-  );
-  placeCursorAtEnd(editor);
-  return true;
 }
 
 function placeCursorAtEnd(editor: HTMLElement) {
@@ -461,7 +455,7 @@ function updateButton() {
   state.button.classList.toggle("is-listening", listening);
   state.button.classList.toggle("is-busy", busy);
   state.button.disabled = busy;
-  const label = busy ? "Transcribing" : listening ? "Stop voice input" : "Start voice input";
+  const label = busy ? "Finishing" : listening ? "Stop voice input" : "Start voice input";
   state.button.setAttribute("aria-label", label);
   state.button.title = label;
   state.button.setAttribute("aria-pressed", String(listening));
@@ -556,15 +550,11 @@ function injectStyle() {
 
 function cleanup() {
   state.session += 1;
-  state.abort?.abort();
-  teardownCapture();
+  resetSession();
   state.button?.remove();
   state.style?.remove();
   state.observer?.disconnect();
   document.querySelector("[data-opencode-voice-status]")?.remove();
-  state.phase = "idle";
-  state.detector = freshDetector();
-  state.abort = undefined;
   voiceWindow[STATE_KEY] = undefined;
 }
 
