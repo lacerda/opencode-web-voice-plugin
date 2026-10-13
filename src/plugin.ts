@@ -1,7 +1,8 @@
 // Voice input for OpenCode Web through Lens.
-// Records audio in the browser and sends it to an OpenAI-compatible
-// transcription endpoint through Lens (POST /__lens/stt), instead of the
-// browser's Web Speech API. Audio never leaves your own machines.
+// Captures microphone audio in the browser, splits it into phrases at short
+// pauses, and sends each phrase as WAV to an OpenAI-compatible transcription
+// endpoint through Lens (POST /__lens/stt). Text appears phrase by phrase while
+// you keep talking. Audio never leaves your own machines.
 
 const STATE_KEY = "__opencodeWebVoicePlugin";
 const TRANSCRIBE_URL = "/__lens/stt";
@@ -9,7 +10,27 @@ const DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo";
 // Override the model per browser with:
 // localStorage.setItem("opencode-voice-stt-model", "<model name>")
 const MODEL_STORAGE_KEY = "opencode-voice-stt-model";
-const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus"];
+
+// Phrase detection. Times in milliseconds, levels as RMS of samples in [-1, 1].
+const WINDOW_MS = 20; // loudness is measured over windows of this length
+const SILENCE_MS = 700; // a pause this long ends a phrase
+const MIN_SPEECH_MS = 250; // shorter bursts (clicks, coughs) are dropped
+const MAX_PHRASE_MS = 25_000; // long monologues are cut at this length
+const PREROLL_MS = 300; // audio kept from just before speech starts
+const MIN_LEVEL = 0.015; // never treat anything quieter than this as speech
+const NOISE_RATIO = 3; // speech must be this many times louder than background
+const TARGET_RATE = 16_000; // sample rate sent to the transcription server
+
+const TAP_PROCESSOR = `
+class OpencodeVoiceTap extends AudioWorkletProcessor {
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (channel) this.port.postMessage(channel.slice(0));
+    return true;
+  }
+}
+registerProcessor("opencode-voice-tap", OpencodeVoiceTap);
+`;
 
 type VoiceWindow = Window & {
   [STATE_KEY]?: { cleanup: () => void };
@@ -17,22 +38,66 @@ type VoiceWindow = Window & {
 
 const voiceWindow = window as VoiceWindow;
 
-type Phase = "idle" | "starting" | "recording" | "transcribing";
+type Phase = "idle" | "starting" | "listening" | "finishing";
+
+type Capture = {
+  context: AudioContext;
+  stream: MediaStream;
+  source: MediaStreamAudioSourceNode;
+  tap: AudioWorkletNode;
+  sink: GainNode;
+  rate: number;
+};
+
+type Detector = {
+  preroll: Float32Array[];
+  prerollSamples: number;
+  phrase: Float32Array[];
+  phraseSamples: number;
+  inPhrase: boolean;
+  speechMs: number;
+  silenceMs: number;
+  noise: number;
+  windowSum: number;
+  windowCount: number;
+};
 
 type State = {
   phase: Phase;
-  chunks: Blob[];
-  recorder?: MediaRecorder;
-  stream?: MediaStream;
+  session: number;
+  capture?: Capture;
+  detector: Detector;
+  queue: Promise<void>;
+  pending: number;
+  inserted: number;
   abort?: AbortController;
   button?: HTMLButtonElement;
   style?: HTMLStyleElement;
   observer?: MutationObserver;
 };
 
+function freshDetector(): Detector {
+  return {
+    preroll: [],
+    prerollSamples: 0,
+    phrase: [],
+    phraseSamples: 0,
+    inPhrase: false,
+    speechMs: 0,
+    silenceMs: 0,
+    noise: 0.005,
+    windowSum: 0,
+    windowCount: 0,
+  };
+}
+
 const state: State = {
   phase: "idle",
-  chunks: [],
+  session: 0,
+  detector: freshDetector(),
+  queue: Promise.resolve(),
+  pending: 0,
+  inserted: 0,
 };
 
 function main() {
@@ -80,115 +145,267 @@ function attachWhenReady() {
 }
 
 async function toggleRecording() {
-  if (state.phase === "recording") {
-    state.recorder?.stop();
+  if (state.phase === "listening") {
+    await stopListening();
     return;
   }
   if (state.phase !== "idle") return;
 
-  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+  if (
+    !navigator.mediaDevices?.getUserMedia ||
+    typeof AudioContext === "undefined" ||
+    typeof AudioWorkletNode === "undefined"
+  ) {
     showStatus(
-      "Microphone recording is not available here. Open OpenCode Web over HTTPS or localhost.",
+      "Microphone capture is not available here. Open OpenCode Web over HTTPS or localhost.",
       true,
     );
     return;
   }
 
   state.phase = "starting";
+  state.session += 1;
+  state.detector = freshDetector();
+  state.inserted = 0;
+  state.abort = new AbortController();
   updateButton();
 
-  let stream: MediaStream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.capture = await startCapture(state.session);
   } catch (error) {
+    teardownCapture();
     state.phase = "idle";
     updateButton();
     showStatus(`Microphone access failed: ${errorMessage(error)}`, true);
     return;
   }
 
-  let recorder: MediaRecorder;
-  try {
-    const mimeType = MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type));
-    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-  } catch (error) {
-    stream.getTracks().forEach((track) => track.stop());
-    state.phase = "idle";
-    updateButton();
-    showStatus(`Recording could not start: ${errorMessage(error)}`, true);
-    return;
-  }
-
-  state.stream = stream;
-  state.recorder = recorder;
-  state.chunks = [];
-  recorder.ondataavailable = (event) => {
-    if (event.data.size > 0) state.chunks.push(event.data);
-  };
-  recorder.onstop = () => {
-    void finishRecording(recorder);
-  };
-  recorder.start();
-
-  state.phase = "recording";
+  state.phase = "listening";
   updateButton();
-  showStatus("Recording. Click the mic again to stop.");
+  showListening();
 }
 
-async function finishRecording(recorder: MediaRecorder) {
-  if (state.recorder !== recorder) return;
+async function startCapture(session: number): Promise<Capture> {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  const context = new AudioContext();
+  try {
+    await context.resume();
+    const moduleUrl = URL.createObjectURL(
+      new Blob([TAP_PROCESSOR], { type: "application/javascript" }),
+    );
+    try {
+      await context.audioWorklet.addModule(moduleUrl);
+    } finally {
+      URL.revokeObjectURL(moduleUrl);
+    }
+    const source = context.createMediaStreamSource(stream);
+    const tap = new AudioWorkletNode(context, "opencode-voice-tap");
+    const sink = context.createGain();
+    sink.gain.value = 0; // keeps the graph running without playing anything
+    tap.port.onmessage = (event: MessageEvent<Float32Array>) => {
+      if (state.session === session && state.phase === "listening") onSamples(event.data);
+    };
+    source.connect(tap);
+    tap.connect(sink);
+    sink.connect(context.destination);
+    return { context, stream, source, tap, sink, rate: context.sampleRate };
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    void context.close();
+    throw error;
+  }
+}
 
-  stopStream();
-  const type = recorder.mimeType || state.chunks[0]?.type || "audio/webm";
-  const blob = new Blob(state.chunks, { type });
-  state.chunks = [];
-  state.recorder = undefined;
+function onSamples(samples: Float32Array) {
+  const capture = state.capture;
+  if (!capture) return;
+  const detector = state.detector;
 
-  if (blob.size === 0) {
-    state.phase = "idle";
-    updateButton();
-    showStatus("No audio was recorded.", true);
+  if (detector.inPhrase) {
+    detector.phrase.push(samples);
+    detector.phraseSamples += samples.length;
+  } else {
+    detector.preroll.push(samples);
+    detector.prerollSamples += samples.length;
+    const keep = (PREROLL_MS / 1000) * capture.rate;
+    while (detector.prerollSamples - (detector.preroll[0]?.length ?? 0) > keep) {
+      detector.prerollSamples -= detector.preroll.shift()!.length;
+    }
+  }
+
+  for (let i = 0; i < samples.length; i++) detector.windowSum += samples[i] * samples[i];
+  detector.windowCount += samples.length;
+  if (detector.windowCount >= (WINDOW_MS / 1000) * capture.rate) {
+    const level = Math.sqrt(detector.windowSum / detector.windowCount);
+    detector.windowSum = 0;
+    detector.windowCount = 0;
+    onWindow(level, capture.rate);
+  }
+}
+
+function onWindow(level: number, rate: number) {
+  const detector = state.detector;
+  const loud = level > Math.max(MIN_LEVEL, detector.noise * NOISE_RATIO);
+
+  if (!detector.inPhrase) {
+    if (loud) {
+      detector.inPhrase = true;
+      detector.phrase = detector.preroll;
+      detector.phraseSamples = detector.prerollSamples;
+      detector.preroll = [];
+      detector.prerollSamples = 0;
+      detector.speechMs = WINDOW_MS;
+      detector.silenceMs = 0;
+    } else {
+      // Slowly follow the background level while nobody is speaking.
+      detector.noise = detector.noise * 0.95 + level * 0.05;
+    }
     return;
   }
 
-  state.phase = "transcribing";
-  updateButton();
-  showStatus("Transcribing...");
+  if (loud) {
+    detector.speechMs += WINDOW_MS;
+    detector.silenceMs = 0;
+  } else {
+    detector.silenceMs += WINDOW_MS;
+  }
 
+  const phraseMs = (detector.phraseSamples / rate) * 1000;
+  if (detector.silenceMs >= SILENCE_MS || phraseMs >= MAX_PHRASE_MS) endPhrase();
+}
+
+function endPhrase() {
+  const capture = state.capture;
+  const detector = state.detector;
+  if (!capture || !detector.inPhrase) return;
+
+  const chunks = detector.phrase;
+  const total = detector.phraseSamples;
+  const speechMs = detector.speechMs;
+  detector.inPhrase = false;
+  detector.phrase = [];
+  detector.phraseSamples = 0;
+  detector.speechMs = 0;
+  detector.silenceMs = 0;
+
+  if (speechMs < MIN_SPEECH_MS) return;
+
+  const samples = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    samples.set(chunk, offset);
+    offset += chunk.length;
+  }
+  enqueue(encodeWav(samples, capture.rate));
+}
+
+function enqueue(wav: Blob) {
+  const session = state.session;
+  const signal = state.abort?.signal;
+  state.pending += 1;
+  showListening();
+  state.queue = state.queue
+    .then(() => transcribe(wav, session, signal))
+    .finally(() => {
+      state.pending -= 1;
+      if (state.session === session && state.phase === "listening") showListening();
+    });
+}
+
+async function transcribe(wav: Blob, session: number, signal?: AbortSignal) {
+  if (signal?.aborted) return;
   const form = new FormData();
-  form.append("file", blob, `voice.${extensionFor(type)}`);
+  form.append("file", wav, "phrase.wav");
   form.append("model", sttModel());
   form.append("response_format", "json");
 
-  const abort = new AbortController();
-  state.abort = abort;
   try {
-    const response = await fetch(TRANSCRIBE_URL, {
-      method: "POST",
-      body: form,
-      signal: abort.signal,
-    });
+    const response = await fetch(TRANSCRIBE_URL, { method: "POST", body: form, signal });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 200);
       throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
     }
     const data = (await response.json()) as { text?: string };
-    const committed = commitTranscript((data.text ?? "").trim());
-    if (committed === true) {
-      showStatus("Voice input inserted. Review it, then send.");
-    } else if (committed === undefined) {
-      showStatus("No speech was recognized.");
-    }
+    if (state.session !== session) return;
+    if (commitTranscript((data.text ?? "").trim()) === true) state.inserted += 1;
   } catch (error) {
-    if (abort.signal.aborted) return;
+    if (signal?.aborted || state.session !== session) return;
     showStatus(`Transcription failed: ${errorMessage(error)}`, true);
-  } finally {
-    if (state.abort === abort) {
-      state.abort = undefined;
-      state.phase = "idle";
-      updateButton();
-    }
   }
+}
+
+async function stopListening() {
+  const session = state.session;
+  state.phase = "finishing";
+  updateButton();
+  endPhrase();
+  teardownCapture();
+  if (state.pending > 0) showStatus("Transcribing the last phrase...");
+
+  await state.queue;
+  if (state.session !== session) return;
+
+  state.phase = "idle";
+  state.abort = undefined;
+  updateButton();
+  showStatus(
+    state.inserted > 0 ? "Voice input inserted. Review it, then send." : "No speech was recognized.",
+  );
+}
+
+function teardownCapture() {
+  const capture = state.capture;
+  state.capture = undefined;
+  if (!capture) return;
+  capture.tap.port.onmessage = null;
+  capture.source.disconnect();
+  capture.tap.disconnect();
+  capture.sink.disconnect();
+  capture.stream.getTracks().forEach((track) => track.stop());
+  void capture.context.close();
+}
+
+function showListening() {
+  const waiting = state.pending > 0 ? ` Transcribing ${state.pending}...` : "";
+  showStatus(`Listening. Pause to send a phrase, click the mic to stop.${waiting}`);
+}
+
+function encodeWav(samples: Float32Array, rate: number): Blob {
+  // Downsample to TARGET_RATE by averaging, then write 16-bit mono PCM.
+  const outRate = rate > TARGET_RATE ? TARGET_RATE : rate;
+  const ratio = rate / outRate;
+  const length = Math.floor(samples.length / ratio);
+  const buffer = new ArrayBuffer(44 + length * 2);
+  const view = new DataView(buffer);
+
+  const writeText = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  writeText(0, "RIFF");
+  view.setUint32(4, 36 + length * 2, true);
+  writeText(8, "WAVE");
+  writeText(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, outRate, true);
+  view.setUint32(28, outRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeText(36, "data");
+  view.setUint32(40, length * 2, true);
+
+  for (let i = 0; i < length; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.max(start + 1, Math.min(samples.length, Math.floor((i + 1) * ratio)));
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += samples[j];
+    const value = Math.max(-1, Math.min(1, sum / (end - start)));
+    view.setInt16(44 + i * 2, value < 0 ? value * 0x8000 : value * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
 }
 
 function sttModel(): string {
@@ -197,17 +414,6 @@ function sttModel(): string {
   } catch {
     return DEFAULT_MODEL;
   }
-}
-
-function extensionFor(type: string): string {
-  if (type.includes("mp4")) return "m4a";
-  if (type.includes("ogg")) return "ogg";
-  return "webm";
-}
-
-function stopStream() {
-  state.stream?.getTracks().forEach((track) => track.stop());
-  state.stream = undefined;
 }
 
 function errorMessage(error: unknown): string {
@@ -250,15 +456,15 @@ function placeCursorAtEnd(editor: HTMLElement) {
 function updateButton() {
   if (!state.button) return;
 
-  const recording = state.phase === "recording" || state.phase === "starting";
-  const busy = state.phase === "transcribing";
-  state.button.classList.toggle("is-listening", recording);
+  const listening = state.phase === "listening" || state.phase === "starting";
+  const busy = state.phase === "finishing";
+  state.button.classList.toggle("is-listening", listening);
   state.button.classList.toggle("is-busy", busy);
   state.button.disabled = busy;
-  const label = busy ? "Transcribing" : recording ? "Stop voice input" : "Start voice input";
+  const label = busy ? "Transcribing" : listening ? "Stop voice input" : "Start voice input";
   state.button.setAttribute("aria-label", label);
   state.button.title = label;
-  state.button.setAttribute("aria-pressed", String(recording));
+  state.button.setAttribute("aria-pressed", String(listening));
 }
 
 function showStatus(message: string, error = false) {
@@ -349,20 +555,15 @@ function injectStyle() {
 }
 
 function cleanup() {
-  if (state.recorder) {
-    state.recorder.ondataavailable = null;
-    state.recorder.onstop = null;
-    if (state.recorder.state !== "inactive") state.recorder.stop();
-  }
-  stopStream();
+  state.session += 1;
   state.abort?.abort();
+  teardownCapture();
   state.button?.remove();
   state.style?.remove();
   state.observer?.disconnect();
   document.querySelector("[data-opencode-voice-status]")?.remove();
   state.phase = "idle";
-  state.chunks = [];
-  state.recorder = undefined;
+  state.detector = freshDetector();
   state.abort = undefined;
   voiceWindow[STATE_KEY] = undefined;
 }
