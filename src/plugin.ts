@@ -10,6 +10,7 @@ const SEND_INTERVAL_MS = 100; // raw audio is sent in chunks of this length
 const RECORDER_TIMESLICE_MS = 250; // WebM chunk length if the server asks for WebM
 const CONFIG_TIMEOUT_MS = 15_000; // first connection may wait for the model to load
 const STOP_TIMEOUT_MS = 30_000;
+const SWITCH_TIMEOUT_MS = 3_000; // longest wait for the old session to end after a send
 // Prompt boxes in older and newer OpenCode Web versions.
 const COMPOSER_SELECTOR = [
   '[data-component="prompt-input-v2"]',
@@ -319,7 +320,19 @@ function onServerMessage(data: ServerMessage, session: number) {
 
 async function startCapture(session: number): Promise<Capture> {
   const stream = await openMicrophone();
-  const context = new AudioContext();
+  // Ask the browser to deliver 16 kHz directly: its resampler is better than
+  // ours. Some browsers refuse to connect a microphone to a context with a
+  // different rate; then use the default rate and convert in flushPcm.
+  let context: AudioContext;
+  let source: MediaStreamAudioSourceNode;
+  try {
+    context = new AudioContext({ sampleRate: TARGET_RATE });
+    source = context.createMediaStreamSource(stream);
+  } catch {
+    context = new AudioContext();
+    source = context.createMediaStreamSource(stream);
+  }
+  LOG("capture rate", context.sampleRate);
   try {
     await context.resume();
     const moduleUrl = URL.createObjectURL(
@@ -330,7 +343,6 @@ async function startCapture(session: number): Promise<Capture> {
     } finally {
       URL.revokeObjectURL(moduleUrl);
     }
-    const source = context.createMediaStreamSource(stream);
     const tap = new AudioWorkletNode(context, "opencode-voice-tap");
     const sink = context.createGain();
     sink.gain.value = 0; // keeps the graph running without playing anything
@@ -645,14 +657,32 @@ function restartTranscription(session: number) {
     opened = true;
     openSocket(session);
   };
-  if (old && (old.readyState === WebSocket.OPEN || old.readyState === WebSocket.CONNECTING)) {
-    old.onmessage = null;
+  if (old && old.readyState === WebSocket.OPEN) {
+    // End the old session the way the stop button does: send the empty
+    // "end of audio" message and wait for the server to confirm. The server
+    // handles one session at a time, so an abruptly closed one can get stuck.
     old.onerror = null;
-    // Let the server close the old session first; it handles one at a time.
     old.onclose = openNext;
-    old.close();
-    window.setTimeout(openNext, 1000);
+    old.onmessage = (event) => {
+      if (typeof event.data !== "string") return;
+      try {
+        if ((JSON.parse(event.data) as ServerMessage).type === "ready_to_stop") old.close();
+      } catch {
+        // ignore
+      }
+    };
+    old.send(new ArrayBuffer(0));
+    window.setTimeout(() => {
+      if (old.readyState === WebSocket.OPEN) old.close();
+      window.setTimeout(openNext, 500);
+    }, SWITCH_TIMEOUT_MS);
   } else {
+    if (old) {
+      old.onmessage = null;
+      old.onclose = null;
+      old.onerror = null;
+      old.close();
+    }
     openNext();
   }
 }
