@@ -12,6 +12,7 @@ const CONFIG_TIMEOUT_MS = 15_000; // first connection may wait for the model to 
 const STOP_TIMEOUT_MS = 30_000;
 // Prompt boxes in older and newer OpenCode Web versions.
 const COMPOSER_SELECTOR = [
+  '[data-component="prompt-input-v2"]',
   'form[data-component="composer"]',
   '[data-component="session-composer"]',
   '[data-component="session-new-composer"]',
