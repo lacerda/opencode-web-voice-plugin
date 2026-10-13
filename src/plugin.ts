@@ -23,6 +23,8 @@ const EDITOR_SELECTOR = [
   '[data-component="prompt-input"][contenteditable="true"]',
 ].join(", ");
 const LOG = (...args: unknown[]) => console.info("[voice]", ...args);
+// The chosen microphone is saved per browser under this key.
+const DEVICE_STORAGE_KEY = "opencode-voice-input-device";
 
 const TAP_PROCESSOR = `
 class OpencodeVoiceTap extends AudioWorkletProcessor {
@@ -77,6 +79,8 @@ type State = {
   configTimer?: number;
   finishStop?: () => void;
   buttons: Set<HTMLButtonElement>;
+  pickers: Set<HTMLButtonElement>;
+  menu?: HTMLElement;
   composer?: HTMLElement;
   messages: number;
   style?: HTMLStyleElement;
@@ -92,6 +96,7 @@ const state: State = {
   baseText: "",
   transcript: "",
   buttons: new Set(),
+  pickers: new Set(),
   messages: 0,
 };
 
@@ -108,8 +113,11 @@ function main() {
 }
 
 function attachWhenReady() {
-  for (const button of [...state.buttons]) {
+  for (const button of Array.from(state.buttons)) {
     if (!button.isConnected) state.buttons.delete(button);
+  }
+  for (const picker of Array.from(state.pickers)) {
+    if (!picker.isConnected) state.pickers.delete(picker);
   }
   for (const composer of Array.from(document.querySelectorAll<HTMLElement>(COMPOSER_SELECTOR))) {
     if (composer.querySelector("[data-opencode-voice-input]")) continue;
@@ -136,12 +144,28 @@ function attachWhenReady() {
     const actions =
       composer.querySelector<HTMLElement>('[data-slot="composer-actions"]') ??
       composer.querySelector<HTMLElement>('[data-action="prompt-attach"]')?.parentElement;
+    const picker = document.createElement("button");
+    picker.type = "button";
+    picker.dataset.opencodeVoiceDevice = "true";
+    picker.className = "opencode-web-voice-plugin-device";
+    picker.title = "Choose microphone";
+    picker.setAttribute("aria-label", "Choose microphone");
+    picker.setAttribute("aria-haspopup", "menu");
+    picker.innerHTML = `<svg aria-hidden="true" viewBox="0 0 10 10" fill="none"><path d="M2 3.5 5 6.5 8 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    picker.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void openDeviceMenu(picker);
+    });
+
     if (actions) {
-      actions.insertBefore(button, actions.firstChild);
+      actions.insertBefore(picker, actions.firstChild);
+      actions.insertBefore(button, picker);
     } else {
       composer.appendChild(button);
+      composer.appendChild(picker);
     }
     state.buttons.add(button);
+    state.pickers.add(picker);
   }
   updateButton();
 }
@@ -283,9 +307,7 @@ function onServerMessage(data: ServerMessage, session: number) {
 }
 
 async function startCapture(session: number): Promise<Capture> {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
+  const stream = await openMicrophone();
   const context = new AudioContext();
   try {
     await context.resume();
@@ -313,6 +335,126 @@ async function startCapture(session: number): Promise<Capture> {
     void context.close();
     throw error;
   }
+}
+
+async function openMicrophone(): Promise<MediaStream> {
+  const base = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  const saved = savedDevice();
+  if (saved) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: { ...base, deviceId: { exact: saved } },
+      });
+    } catch (error) {
+      const name = error instanceof DOMException ? error.name : "";
+      if (name !== "OverconstrainedError" && name !== "NotFoundError") throw error;
+      saveDevice("");
+      showStatus("The chosen microphone is not available. Using the default.");
+    }
+  }
+  return navigator.mediaDevices.getUserMedia({ audio: base });
+}
+
+function savedDevice(): string {
+  try {
+    return localStorage.getItem(DEVICE_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function saveDevice(id: string) {
+  try {
+    if (id) localStorage.setItem(DEVICE_STORAGE_KEY, id);
+    else localStorage.removeItem(DEVICE_STORAGE_KEY);
+  } catch {
+    // Storage can be unavailable (private mode); the choice then lasts until reload.
+  }
+}
+
+async function listMicrophones(): Promise<MediaDeviceInfo[]> {
+  let devices = (await navigator.mediaDevices.enumerateDevices()).filter(
+    (device) => device.kind === "audioinput",
+  );
+  // Browsers hide device names until the page has had microphone access once.
+  if (devices.length > 0 && devices.every((device) => !device.label)) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+    devices = (await navigator.mediaDevices.enumerateDevices()).filter(
+      (device) => device.kind === "audioinput",
+    );
+  }
+  return devices.filter((device) => device.deviceId && device.deviceId !== "default");
+}
+
+function closeDeviceMenu() {
+  state.menu?.remove();
+  state.menu = undefined;
+  document.removeEventListener("click", closeDeviceMenu);
+  document.removeEventListener("keydown", onMenuKey);
+}
+
+function onMenuKey(event: KeyboardEvent) {
+  if (event.key === "Escape") closeDeviceMenu();
+}
+
+async function openDeviceMenu(anchor: HTMLElement) {
+  if (state.menu) {
+    closeDeviceMenu();
+    return;
+  }
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    showStatus("This browser cannot list microphones.", true);
+    return;
+  }
+
+  let devices: MediaDeviceInfo[];
+  try {
+    devices = await listMicrophones();
+  } catch (error) {
+    showStatus(`Could not list microphones: ${errorMessage(error)}`, true);
+    return;
+  }
+
+  const current = savedDevice();
+  const menu = document.createElement("div");
+  menu.className = "opencode-web-voice-plugin-menu";
+  menu.setAttribute("role", "menu");
+  const options: Array<{ id: string; label: string }> = [
+    { id: "", label: "System default" },
+    ...devices.map((device, index) => ({
+      id: device.deviceId,
+      label: device.label || `Microphone ${index + 1}`,
+    })),
+  ];
+  for (const option of options) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.setAttribute("role", "menuitemradio");
+    item.setAttribute("aria-checked", String(option.id === current));
+    item.className = "opencode-web-voice-plugin-menu-item";
+    item.textContent = `${option.id === current ? "✓ " : ""}${option.label}`;
+    item.addEventListener("click", (event) => {
+      event.stopPropagation();
+      saveDevice(option.id);
+      closeDeviceMenu();
+      const later = state.phase === "idle" ? "" : " It applies from the next recording.";
+      showStatus(`Microphone: ${option.label}.${later}`);
+    });
+    menu.appendChild(item);
+  }
+
+  document.body.appendChild(menu);
+  const box = anchor.getBoundingClientRect();
+  const height = menu.offsetHeight;
+  const top = box.top - height - 6 >= 8 ? box.top - height - 6 : box.bottom + 6;
+  menu.style.top = `${Math.max(8, top)}px`;
+  menu.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - menu.offsetWidth - 8))}px`;
+  state.menu = menu;
+  window.setTimeout(() => {
+    document.addEventListener("click", closeDeviceMenu);
+    document.addEventListener("keydown", onMenuKey);
+  }, 0);
 }
 
 function onSamples(samples: Float32Array) {
@@ -550,6 +692,65 @@ function injectStyle() {
       opacity: 0.5;
       cursor: progress;
     }
+    .opencode-web-voice-plugin-device {
+      width: 16px;
+      height: 32px;
+      margin-left: -4px;
+      border: 0;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      padding: 0;
+      background: transparent;
+      color: currentColor;
+      cursor: pointer;
+      opacity: 0.55;
+    }
+    .opencode-web-voice-plugin-device svg {
+      width: 10px;
+      height: 10px;
+    }
+    .opencode-web-voice-plugin-device:hover,
+    .opencode-web-voice-plugin-device:focus-visible {
+      opacity: 1;
+      background: color-mix(in srgb, currentColor 12%, transparent);
+      outline: none;
+    }
+    .opencode-web-voice-plugin-menu {
+      position: fixed;
+      z-index: 2147483647;
+      min-width: 220px;
+      max-width: min(360px, calc(100vw - 16px));
+      padding: 4px;
+      border: 1px solid color-mix(in srgb, canvastext 16%, transparent);
+      border-radius: 10px;
+      background: canvas;
+      color: canvastext;
+      box-shadow: 0 10px 30px rgb(0 0 0 / 22%);
+      font: 13px/1.35 system-ui, sans-serif;
+    }
+    .opencode-web-voice-plugin-menu-item {
+      display: block;
+      width: 100%;
+      padding: 7px 10px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .opencode-web-voice-plugin-menu-item:hover,
+    .opencode-web-voice-plugin-menu-item:focus-visible {
+      background: color-mix(in srgb, canvastext 10%, transparent);
+      outline: none;
+    }
     .opencode-web-voice-plugin-icon {
       width: 20px;
       height: 20px;
@@ -592,6 +793,9 @@ function cleanup() {
   resetSession();
   state.buttons.forEach((button) => button.remove());
   state.buttons.clear();
+  state.pickers.forEach((picker) => picker.remove());
+  state.pickers.clear();
+  closeDeviceMenu();
   state.style?.remove();
   state.observer?.disconnect();
   document.querySelector("[data-opencode-voice-status]")?.remove();
