@@ -10,6 +10,18 @@ const SEND_INTERVAL_MS = 100; // raw audio is sent in chunks of this length
 const RECORDER_TIMESLICE_MS = 250; // WebM chunk length if the server asks for WebM
 const CONFIG_TIMEOUT_MS = 15_000; // first connection may wait for the model to load
 const STOP_TIMEOUT_MS = 30_000;
+// Prompt boxes in older and newer OpenCode Web versions.
+const COMPOSER_SELECTOR = [
+  'form[data-component="composer"]',
+  '[data-component="session-composer"]',
+  '[data-component="session-new-composer"]',
+  '[data-component="session-prompt-dock"]',
+].join(", ");
+const EDITOR_SELECTOR = [
+  '[data-component="composer-editor"][contenteditable="true"]',
+  '[data-component="prompt-input"][contenteditable="true"]',
+].join(", ");
+const LOG = (...args: unknown[]) => console.info("[voice]", ...args);
 
 const TAP_PROCESSOR = `
 class OpencodeVoiceTap extends AudioWorkletProcessor {
@@ -63,7 +75,9 @@ type State = {
   stopTimer?: number;
   configTimer?: number;
   finishStop?: () => void;
-  button?: HTMLButtonElement;
+  buttons: Set<HTMLButtonElement>;
+  composer?: HTMLElement;
+  messages: number;
   style?: HTMLStyleElement;
   observer?: MutationObserver;
 };
@@ -76,6 +90,8 @@ const state: State = {
   pendingSamples: 0,
   baseText: "",
   transcript: "",
+  buttons: new Set(),
+  messages: 0,
 };
 
 function main() {
@@ -91,38 +107,45 @@ function main() {
 }
 
 function attachWhenReady() {
-  const form = document.querySelector<HTMLElement>(
-    '[data-component="session-composer"], [data-component="session-new-composer"], [data-component="session-prompt-dock"]',
-  );
-  if (!form || form.querySelector("[data-opencode-voice-input]")) return;
+  for (const button of [...state.buttons]) {
+    if (!button.isConnected) state.buttons.delete(button);
+  }
+  for (const composer of Array.from(document.querySelectorAll<HTMLElement>(COMPOSER_SELECTOR))) {
+    if (composer.querySelector("[data-opencode-voice-input]")) continue;
+    // Nested matches (a dock that contains a composer) get one button only.
+    if (composer.parentElement?.closest(COMPOSER_SELECTOR)?.querySelector("[data-opencode-voice-input]")) {
+      continue;
+    }
 
-  const actions = form.querySelector<HTMLElement>('[data-action="prompt-attach"]')?.parentElement;
-  const button = document.createElement("button");
-  button.type = "button";
-  button.dataset.opencodeVoiceInput = "true";
-  button.className = "opencode-web-voice-plugin-button";
-  button.title = "Voice input";
-  button.setAttribute("aria-label", "Start voice input");
-  button.innerHTML = `
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.opencodeVoiceInput = "true";
+    button.className = "opencode-web-voice-plugin-button";
+    button.title = "Voice input";
+    button.setAttribute("aria-label", "Start voice input");
+    button.innerHTML = `
     <span class="opencode-web-voice-plugin-sr-only">Voice Input</span>
     <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" class="opencode-web-voice-plugin-icon">
       <path d="M10 2.5a2.5 2.5 0 0 0-2.5 2.5v4a2.5 2.5 0 0 0 5 0v-4A2.5 2.5 0 0 0 10 2.5Z" stroke="currentColor" stroke-width="1.5"/>
       <path d="M5 8.5a5 5 0 0 0 10 0M10 13.5v4M7.5 17.5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
     </svg>
   `;
-  button.addEventListener("click", toggleRecording);
+    button.addEventListener("click", () => void toggleRecording(button));
 
-  if (actions) {
-    actions.insertBefore(button, actions.firstChild);
-  } else {
-    form.appendChild(button);
+    const actions =
+      composer.querySelector<HTMLElement>('[data-slot="composer-actions"]') ??
+      composer.querySelector<HTMLElement>('[data-action="prompt-attach"]')?.parentElement;
+    if (actions) {
+      actions.insertBefore(button, actions.firstChild);
+    } else {
+      composer.appendChild(button);
+    }
+    state.buttons.add(button);
   }
-
-  state.button = button;
   updateButton();
 }
 
-async function toggleRecording() {
+async function toggleRecording(button: HTMLButtonElement) {
   if (state.phase === "listening") {
     await stopListening();
     return;
@@ -142,11 +165,13 @@ async function toggleRecording() {
     return;
   }
 
+  state.composer = button.closest<HTMLElement>(COMPOSER_SELECTOR) ?? undefined;
   const editor = findEditor();
   if (!editor) {
     showStatus("Could not find the OpenCode prompt editor.", true);
     return;
   }
+  editor.focus({ preventScroll: true });
 
   state.phase = "starting";
   state.session += 1;
@@ -177,6 +202,8 @@ function openSocket(session: number) {
   const socket = new WebSocket(`${scheme}://${location.host}${ASR_PATH}`);
   socket.binaryType = "arraybuffer";
   state.socket = socket;
+  state.messages = 0;
+  socket.onopen = () => LOG("connected");
 
   state.configTimer = window.setTimeout(() => {
     if (state.session !== session || state.mode !== "pending") return;
@@ -195,7 +222,8 @@ function openSocket(session: number) {
     onServerMessage(data, session);
   };
 
-  socket.onclose = () => {
+  socket.onclose = (event) => {
+    LOG("closed", { code: event.code, reason: event.reason, messages: state.messages, phase: state.phase });
     if (state.session !== session) return;
     if (state.phase === "finishing") {
       state.finishStop?.();
@@ -213,9 +241,14 @@ function openSocket(session: number) {
 }
 
 function onServerMessage(data: ServerMessage, session: number) {
+  state.messages += 1;
+  if (data.type || state.messages % 20 === 1) {
+    LOG("message", state.messages, data.type ?? "transcript", (data.buffer_transcription ?? "").slice(-40));
+  }
   if (data.type === "config") {
     window.clearTimeout(state.configTimer);
     state.mode = data.useAudioWorklet ? "pcm" : "webm";
+    LOG("audio mode", state.mode);
     if (state.mode === "webm") startRecorder(session);
     else flushPcm(true);
     state.phase = "listening";
@@ -412,9 +445,13 @@ function resetSession() {
 }
 
 function findEditor(): HTMLElement | null {
-  return document.querySelector<HTMLElement>(
-    '[data-component="prompt-input"][contenteditable="true"]',
-  );
+  const composer = state.composer;
+  if (composer?.isConnected) {
+    const own = composer.querySelector<HTMLElement>(EDITOR_SELECTOR);
+    if (own) return own;
+  }
+  const editors = Array.from(document.querySelectorAll<HTMLElement>(EDITOR_SELECTOR));
+  return editors.find((editor) => editor.offsetParent !== null) ?? editors[0] ?? null;
 }
 
 function writeTranscript() {
@@ -426,6 +463,7 @@ function writeTranscript() {
       ? " "
       : "";
   const text = `${base}${separator}${state.transcript}`;
+  if (document.activeElement !== editor) editor.focus({ preventScroll: true });
   editor.textContent = text;
   editor.dispatchEvent(
     new InputEvent("input", { bubbles: true, inputType: "insertText", data: state.transcript }),
@@ -448,17 +486,17 @@ function placeCursorAtEnd(editor: HTMLElement) {
 }
 
 function updateButton() {
-  if (!state.button) return;
-
   const listening = state.phase === "listening" || state.phase === "starting";
   const busy = state.phase === "finishing";
-  state.button.classList.toggle("is-listening", listening);
-  state.button.classList.toggle("is-busy", busy);
-  state.button.disabled = busy;
   const label = busy ? "Finishing" : listening ? "Stop voice input" : "Start voice input";
-  state.button.setAttribute("aria-label", label);
-  state.button.title = label;
-  state.button.setAttribute("aria-pressed", String(listening));
+  for (const button of state.buttons) {
+    button.classList.toggle("is-listening", listening);
+    button.classList.toggle("is-busy", busy);
+    button.disabled = busy;
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.setAttribute("aria-pressed", String(listening));
+  }
 }
 
 function showStatus(message: string, error = false) {
@@ -551,7 +589,8 @@ function injectStyle() {
 function cleanup() {
   state.session += 1;
   resetSession();
-  state.button?.remove();
+  state.buttons.forEach((button) => button.remove());
+  state.buttons.clear();
   state.style?.remove();
   state.observer?.disconnect();
   document.querySelector("[data-opencode-voice-status]")?.remove();
