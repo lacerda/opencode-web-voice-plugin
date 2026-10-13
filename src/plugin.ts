@@ -75,6 +75,7 @@ type State = {
   pendingSamples: number;
   baseText: string;
   transcript: string;
+  lastWritten: string;
   stopTimer?: number;
   configTimer?: number;
   finishStop?: () => void;
@@ -95,6 +96,7 @@ const state: State = {
   pendingSamples: 0,
   baseText: "",
   transcript: "",
+  lastWritten: "",
   buttons: new Set(),
   pickers: new Set(),
   messages: 0,
@@ -206,6 +208,7 @@ async function toggleRecording(button: HTMLButtonElement) {
   state.pendingSamples = 0;
   state.transcript = "";
   state.baseText = editor.textContent?.replace(/\u200B/g, "") ?? "";
+  state.lastWritten = state.baseText;
   updateButton();
   showStatus("Connecting...");
 
@@ -267,6 +270,10 @@ function openSocket(session: number) {
 
 function onServerMessage(data: ServerMessage, session: number) {
   state.messages += 1;
+  if (state.phase === "listening" && boxChanged()) {
+    restartTranscription(session);
+    return;
+  }
   if (data.type || state.messages % 20 === 1) {
     LOG("message", state.messages, data.type ?? "transcript", (data.buffer_transcription ?? "").slice(-40));
   }
@@ -274,7 +281,11 @@ function onServerMessage(data: ServerMessage, session: number) {
     window.clearTimeout(state.configTimer);
     state.mode = data.useAudioWorklet ? "pcm" : "webm";
     LOG("audio mode", state.mode);
-    if (state.mode === "webm") startRecorder(session);
+    if (state.mode === "webm") {
+      if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
+      state.recorder = undefined;
+      startRecorder(session);
+    }
     else flushPcm(true);
     state.phase = "listening";
     updateButton();
@@ -597,6 +608,55 @@ function findEditor(): HTMLElement | null {
   return editors.find((editor) => editor.offsetParent !== null) ?? editors[0] ?? null;
 }
 
+function editorText(editor: HTMLElement): string {
+  return editor.textContent?.replace(/\u200B/g, "") ?? "";
+}
+
+// True when the prompt box no longer holds what the plugin last wrote,
+// because the message was sent, or the box was cleared or edited.
+function boxChanged(): boolean {
+  const editor = findEditor();
+  if (!editor) return false;
+  return editorText(editor) !== state.lastWritten;
+}
+
+// Start a new transcription session that continues from the box as it is now.
+// The microphone keeps running; audio captured meanwhile is sent once the new
+// connection is ready, so no speech is lost.
+function restartTranscription(session: number) {
+  const editor = findEditor();
+  const current = editor ? editorText(editor) : "";
+  state.baseText = current;
+  state.lastWritten = current;
+  if (!state.transcript) return; // nothing dictated yet: just follow the edit
+
+  LOG("box changed, starting a new transcription session");
+  state.transcript = "";
+  window.clearTimeout(state.configTimer);
+  if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
+  state.recorder = undefined;
+  state.mode = "pending";
+
+  const old = state.socket;
+  state.socket = undefined;
+  let opened = false;
+  const openNext = () => {
+    if (opened || state.session !== session || state.phase !== "listening") return;
+    opened = true;
+    openSocket(session);
+  };
+  if (old && (old.readyState === WebSocket.OPEN || old.readyState === WebSocket.CONNECTING)) {
+    old.onmessage = null;
+    old.onerror = null;
+    // Let the server close the old session first; it handles one at a time.
+    old.onclose = openNext;
+    old.close();
+    window.setTimeout(openNext, 1000);
+  } else {
+    openNext();
+  }
+}
+
 function writeTranscript() {
   const editor = findEditor();
   if (!editor) return;
@@ -612,6 +672,7 @@ function writeTranscript() {
     new InputEvent("input", { bubbles: true, inputType: "insertText", data: state.transcript }),
   );
   placeCursorAtEnd(editor);
+  state.lastWritten = editorText(editor);
 }
 
 function errorMessage(error: unknown): string {
